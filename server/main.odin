@@ -25,27 +25,32 @@ Error :: enum {
 	Program_Not_Found,
 }
 
-// Commands clients can issue to the server
+// Commands a client can issue to the server
 Command :: enum {
-	Set_Layout,
-	Toggle_Layout,
-	Next_Workspace,
-	Prev_Workspace,
 	None,
+	Set_Layout,
+	Switch_Layout,
+	Toggle_Layout,
+	View_To_Left,
+	View_To_Right,
+	Tag_To_Left,
+	Tag_To_Right,
 }
-
-// How commands are written into the buffer
 @(rodata)
-commands := [Command]string {
-	.Set_Layout     = "set_layout",
-	.Toggle_Layout  = "toggle_layout",
-	.Next_Workspace = "next_workspace",
-	.Prev_Workspace = "prev_workspace",
-	.None           = "",
+command_symbols := [Command]string {
+	.None          = "",
+	.Set_Layout    = "setlayout",
+	.Switch_Layout = "switch_layout",
+	.Toggle_Layout = "", // custom
+	.View_To_Left  = "viewtoleft",
+	.View_To_Right = "viewtoright",
+	.Tag_To_Left   = "tagtoleft",
+	.Tag_To_Right  = "tagtoleft",
 }
 
 // Possible layouts
 Layout :: enum {
+	None,
 	Tile,
 	Scroller,
 	Monocle,
@@ -60,27 +65,32 @@ Layout :: enum {
 	Dwindle,
 	Fair,
 	Vertical_Fair,
-	None,
+}
+@(rodata)
+layout_symbols := [Layout]string {
+	.None              = "",
+	.Tile              = "tile",
+	.Scroller          = "scroller",
+	.Monocle           = "monocle",
+	.Grid              = "grid",
+	.Deck              = "deck",
+	.Center_tile       = "center_tile",
+	.Vertical_Tile     = "vertical_tile",
+	.Right_Tile        = "right_tile",
+	.Vertical_Scroller = "vertical_scroller",
+	.Vertical_Grid     = "vertical_grid",
+	.Vertical_Deck     = "vertical_deck",
+	.Dwindle           = "dwindle",
+	.Fair              = "fair",
+	.Vertical_Fair     = "vertical_fair",
 }
 
-// Default layout symbols
-@(rodata)
-layouts := [Layout]string {
-	.Tile              = "T",
-	.Scroller          = "S",
-	.Grid              = "G",
-	.Monocle           = "M",
-	.Deck              = "K",
-	.Center_tile       = "CT",
-	.Vertical_Tile     = "RT",
-	.Right_Tile        = "VS",
-	.Vertical_Scroller = "VT",
-	.Vertical_Grid     = "VG",
-	.Vertical_Deck     = "VK",
-	.Dwindle           = "DW",
-	.Fair              = "F",
-	.Vertical_Fair     = "VF",
-	.None              = "",
+Tag :: int
+Tags :: [TAG_NUM]bool
+Monitor_State :: struct {
+	layout:     Layout,
+	active_tag: Tag,
+	tags:       Tags,
 }
 
 Message :: struct {
@@ -88,16 +98,9 @@ Message :: struct {
 	layout:  Layout,
 }
 
-Tag :: int
-Tags :: [TAG_NUM]bool
-
-Monitor_State :: struct {
-	layout:     Layout,
-	active_tag: Tag,
-	tags:       Tags,
+State :: struct {
+	prev_layout, curr_layout: Layout,
 }
-
-prev_layout, curr_layout: Layout
 
 main :: proc() {
 	os.exit(int(entrypoint()))
@@ -128,11 +131,11 @@ entrypoint :: proc() -> Error {
 	}
 	vmem.arena_temp_end(temp_begin)
 
-	// Retry 10 times in case address is in use
+	// Retry some times in case address is in use
 	address, _ := net.parse_ip4_address("127.0.0.1")
 	port := 20000
 	server_socket: net.TCP_Socket
-	for attempts := 10;; attempts -= 1 {
+	for attempts := 20;; attempts -= 1 {
 		err: net.Network_Error
 		server_socket, err = net.listen_tcp({address = address, port = port})
 		if err == net.Bind_Error.Address_In_Use && attempts >= 0 {
@@ -146,17 +149,6 @@ entrypoint :: proc() -> Error {
 	}
 	defer net.close(server_socket)
 
-	stdout_fd: ^os.File
-	{
-		err: os.Error
-		stdout_fd, err = os.create_temp_file("", "")
-		if err != nil {
-			fmt.printfln("Failed creating temp file: %v", err)
-			return .Mango_Wrapper_Error
-		}
-	}
-	defer os.close(stdout_fd)
-
 	buf, alloc_err := make([]u8, BUF_SIZE, alloc)
 	if alloc_err != nil {
 		fmt.printfln("Failed allocating memory: %v", alloc_err)
@@ -164,9 +156,15 @@ entrypoint :: proc() -> Error {
 	}
 	temp_begin = vmem.arena_temp_begin(&arena)
 
+	state := State {
+		curr_layout = .Tile,
+		prev_layout = .Monocle,
+	}
 	for {
 		vmem.arena_temp_end(temp_begin)
 
+		// TODO: If bytes read is less than size of Message struct, reread the
+		// socket
 		bytes_read, tcp_err := net.recv_tcp(server_socket, buf)
 		if tcp_err != nil {
 			fmt.printfln("Failed reading TCP socket: %v", tcp_err)
@@ -177,67 +175,55 @@ entrypoint :: proc() -> Error {
 		}
 
 		data := buf[:bytes_read]
-		fmt.println(data)
-
-		message: Message
-		for command, idx in commands {
-			command_len := len(command)
-			cmd_in_buf := string(data[:command_len])
-			if command == cmd_in_buf {
-				message.command = idx
-			}
+		monitor_state := get_monitor_state(alloc)
+		message := Message {
+			command = (^Command)(raw_data(data[:size_of(Command)]))^,
 		}
-
 		switch message.command {
 		case .Set_Layout:
-			for layout, idx in layouts {
-				command_len := len(commands[message.command])
-				layout_len := len(layout)
-				layout_in_buf := string(data[command_len:layout_len])
-				if layout == layout_in_buf {
-					message.layout = idx
-				}
-			}
-
-			if message.layout == .None {
+			data = data[size_of(Command):]
+			message.layout = (^Layout)(raw_data(data[:size_of(Layout)]))^
+			switch message.layout {
+			case .Tile ..= .Vertical_Fair:
+				break
+			case .None:
+				fallthrough
+			case:
+				// TODO: Send error message to client
 				continue
 			}
+		case .Switch_Layout:
 		case .Toggle_Layout:
-			curr_layout, prev_layout = prev_layout, curr_layout
-		case .Next_Workspace:
-
-		case .Prev_Workspace:
+			state.curr_layout, state.prev_layout = state.prev_layout, state.curr_layout
+		case .View_To_Left:
+		case .View_To_Right:
+		case .Tag_To_Left:
+		case .Tag_To_Right:
 		case .None:
+			fallthrough
+		case:
+			// TODO: Send error message to client
 			continue
 		}
 
-		stdout, err := get_monitor_state(stdout_fd, alloc)
-		if err != nil {
-			fmt.printfln("Failed to get monitor state: %v", err)
-		}
-
+		// TODO: Dispatch command to mango
 	}
 
 	return .None
 }
 
-get_monitor_state :: proc(
-	stdout: ^os.File,
-	allocator := context.allocator,
-) -> (
-	state: Monitor_State,
-) {
+get_monitor_state :: proc(allocator := context.allocator) -> (state: Monitor_State) {
 	mmsg_command := [?]string{"mmsg", "get", "all-monitors"}
 	process_state, stdout, _, process_err := os.process_exec(
-		{command = mmsg_command[:], stdout = stdout},
+		{command = mmsg_command[:]},
 		allocator,
 	)
-	if process_state.exit_code != 0 {
-		fmt.printfln("mmsg exit code: %v", process_state.exit_code)
-		return
-	}
 	if process_err != nil {
 		fmt.printfln("Failed invoking mmsg: %v", process_err)
+		return
+	}
+	if process_state.exit_code != 0 {
+		fmt.printfln("mmsg exit code: %v", process_state.exit_code)
 		return
 	}
 
