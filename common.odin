@@ -1,6 +1,23 @@
 package main
 
+import "core:mem"
+import "core:os"
+
+// Can Mango be run on BSDs?
+when ODIN_OS != .Linux {
+	#panic("OS not supported")
+}
+
+LOCALHOST :: "127.0.0.1"
 TAG_NUM :: 6
+
+Program_Error :: enum {
+	None,
+	Mango_Wrapper_Error,
+	Mango_Error,
+	MMSG_Error,
+	Program_Not_Found,
+}
 
 Command :: enum {
 	None,
@@ -31,7 +48,7 @@ Layout :: enum {
 	Vertical_Fair,
 }
 
-MessageError :: enum {
+Message_Error :: enum {
 	None,
 	Set_Layout_Without_Layout,
 	Message_Without_Command,
@@ -40,4 +57,19 @@ MessageError :: enum {
 Message :: struct {
 	command: Command,
 	layout:  Layout,
+}
+
+check_for_mango :: proc(alloc := context.allocator) -> (Maybe(string), Program_Error) {
+	tests := [][3]string{{"command", "-v", "mango"}, {"command", "-v", "mmsg"}}
+	for &test in tests {
+		state, _, _, err := os.process_exec({command = test[:]}, alloc)
+		if state.exit_code != 0 {
+			return test[1], .Program_Not_Found
+		}
+		if err != nil {
+			return nil, .Mango_Wrapper_Error
+		}
+	}
+
+	return nil, .None
 }

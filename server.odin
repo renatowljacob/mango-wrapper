@@ -1,6 +1,7 @@
 package main
 
 import "core:encoding/json"
+import "core:flags"
 import "core:fmt"
 import "core:mem"
 import vmem "core:mem/virtual"
@@ -8,20 +9,7 @@ import "core:net"
 import "core:os"
 import "core:strings"
 
-// Can Mango be run on BSDs?
-when ODIN_OS != .Linux {
-	#panic("OS not supported")
-}
-
 BUF_SIZE :: mem.Megabyte
-
-Program_Error :: enum {
-	None,
-	Mango_Wrapper_Error,
-	Mango_Error,
-	MMSG_Error,
-	Program_Not_Found,
-}
 
 @(rodata)
 command_symbols := [Command]string {
@@ -71,7 +59,13 @@ main :: proc() {
 	os.exit(int(entrypoint()))
 }
 
+@(private = "file")
 entrypoint :: proc() -> Program_Error {
+	Options :: struct {
+		port: u16 `usage:"A port other than 0 to bind to"`,
+	}
+
+	// Setup allocator
 	arena: vmem.Arena
 	if err := vmem.arena_init_static(&arena, BUF_SIZE * 2); err != nil {
 		fmt.eprintfln("Failed on memory allocator init: %v", err)
@@ -82,35 +76,40 @@ entrypoint :: proc() -> Program_Error {
 
 	temp_begin := vmem.arena_temp_begin(&arena)
 
-	tests := [][3]string{{"command", "-v", "mango"}, {"command", "-v", "mmsg"}}
-	for &test in tests {
-		state, _, _, err := os.process_exec({command = test[:]}, alloc)
-		if state.exit_code != 0 {
-			fmt.eprintfln("Failure: %v not found", test[1])
-			return .Program_Not_Found
-		}
-		if err != nil {
+	// Parse flags
+	options: Options
+	flags.parse_or_exit(&options, os.args, flags.Parsing_Style.Odin, allocator = alloc)
+
+	if program_name, err := check_for_mango(alloc); err != nil {
+		if err == .Program_Not_Found {
+			fmt.eprintfln("Failure: %v not found", program_name)
+		} else if err != nil {
 			fmt.eprintfln("Failed invoking command -v: %v", err)
-			return .Mango_Wrapper_Error
 		}
+		return err
 	}
+
 	vmem.arena_temp_end(temp_begin)
 
 	// Retry with new port in case address is in use
-	address, _ := net.parse_ip4_address("127.0.0.1")
-	port := 20000
+	address, _ := net.parse_ip4_address(LOCALHOST)
+	port := int(options.port)
+	ensure(port != 0, "Supplied port must not be 0")
+
 	server_socket: net.TCP_Socket
-	for attempts := 20;; attempts -= 1 {
-		err: net.Network_Error
-		server_socket, err = net.listen_tcp({address = address, port = port})
-		if err == net.Bind_Error.Address_In_Use && attempts >= 0 {
-			port += 1
-			continue
-		}
-		if err != nil {
-			fmt.eprintfln("Failed creating TCP socket: %v", err)
-			return .Mango_Wrapper_Error
-		}
+	network_err: net.Network_Error
+	server_socket, network_err = net.listen_tcp({address = address, port = int(options.port)})
+	if network_err == net.Bind_Error.Address_In_Use {
+		fmt.eprintfln("Failed creating TCP socket: supplied port %v already in use", options.port)
+		return .Mango_Wrapper_Error
+	}
+	if network_err != nil {
+		fmt.eprintfln(
+			"Failed creating TCP socket with supplied port %v: %v",
+			options.port,
+			network_err,
+		)
+		return .Mango_Wrapper_Error
 	}
 	defer net.close(server_socket)
 	fmt.printfln("Listening on port %v", port)
@@ -141,8 +140,8 @@ entrypoint :: proc() -> Program_Error {
 		}
 		read_data := read_buf[:bytes_read]
 
-		write_buf := make([]u8, size_of(MessageError), alloc)
-		write_data := &(transmute([]MessageError)write_buf)[0]
+		write_buf := make([]u8, size_of(Message_Error), alloc)
+		write_data := &(transmute([]Message_Error)write_buf)[0]
 
 		monitor_state: Monitor_State
 		{
@@ -217,7 +216,7 @@ entrypoint :: proc() -> Program_Error {
 			case .None:
 				fallthrough
 			case:
-				write_data^ = MessageError.Set_Layout_Without_Layout
+				write_data^ = Message_Error.Set_Layout_Without_Layout
 				net.send(server_socket, write_buf)
 
 				continue
@@ -248,7 +247,7 @@ entrypoint :: proc() -> Program_Error {
 		case .None:
 			fallthrough
 		case:
-			write_data^ = MessageError.Message_Without_Command
+			write_data^ = Message_Error.Message_Without_Command
 			net.send(server_socket, write_buf)
 
 			continue
@@ -266,7 +265,7 @@ entrypoint :: proc() -> Program_Error {
 			return .MMSG_Error
 		}
 
-		write_data^ = MessageError.None
+		write_data^ = Message_Error.None
 		net.send(server_socket, write_buf)
 	}
 
