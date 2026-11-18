@@ -3,8 +3,9 @@
 level=""
 
 case $1 in
-debug) level="-debug -o:none" ;;
 release) level="-o:speed" ;;
+debug | *) level="-debug -o:none" ;;
 esac
 
-odin build . -keep-executable ${level}
+odin build client -out:client-bin ${level}
+odin build server -out:server-bin ${level}
