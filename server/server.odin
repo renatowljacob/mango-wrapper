@@ -91,6 +91,7 @@ entrypoint :: proc() -> (program_err: Program_Error) {
 		return .Mango_Wrapper_Error
 	}
 
+	// Since setenv() just affects the process' and children's environment, I gotta find another way of exposing the socket's path
 	if set_env_err := os.set_env(SOCKET_PATH_ENVVAR, server_socket_path); set_env_err != nil {
 		fmt.eprintfln("Failed setting socket path environment variable: %v", set_env_err)
 		return .Mango_Wrapper_Error
