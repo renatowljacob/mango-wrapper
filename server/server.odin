@@ -58,17 +58,21 @@ entrypoint :: proc() -> (program_err: Program_Error) {
 	}
 	defer linux.close(server_socket)
 
-	temp_dir, temp_dir_err := os.temp_directory(alloc)
-	if temp_dir_err != nil {
-		fmt.eprintfln("Failed getting temp directory: %v", temp_dir_err)
-		return .Mango_Wrapper_Error
+	// Construct socket path
+	server_socket_path: string
+	{
+		found: bool
+		server_socket_path, found = os.lookup_env(SOCKET_PATH_ENVVAR, allocator = alloc)
+		if !found {
+			temp_dir: string
+			temp_dir, found = os.lookup_env("XDG_RUNTIME_DIR", allocator = alloc)
+			if !found {
+				temp_dir = "/tmp"
+			}
+
+			server_socket_path = fmt.aprintf("%s/mango-wrapper.sock", temp_dir, allocator = alloc)
+		}
 	}
-	server_socket_path := fmt.aprintf(
-		"%s/mango-wrapper-%d.sock",
-		temp_dir,
-		os.get_pid(),
-		allocator = alloc,
-	)
 	os.remove(server_socket_path)
 
 	server_socket_addr := linux.Sock_Addr_Un {
@@ -90,32 +94,30 @@ entrypoint :: proc() -> (program_err: Program_Error) {
 		fmt.eprintfln("Failed setting socket to listen: %v", errno_str)
 		return .Mango_Wrapper_Error
 	}
-
-	// Since setenv() just affects the process' and children's environment, I gotta find another way of exposing the socket's path
-	if set_env_err := os.set_env(SOCKET_PATH_ENVVAR, server_socket_path); set_env_err != nil {
-		fmt.eprintfln("Failed setting socket path environment variable: %v", set_env_err)
-		return .Mango_Wrapper_Error
-	}
-	defer os.unset_env(SOCKET_PATH_ENVVAR)
-
 	fmt.printfln("Listening on %v", server_socket_path)
 
-	// Set up connection to mango's socket
-	mango_socket_path, found := os.lookup_env(MANGO_SOCKET_ENVVAR, allocator = alloc)
-	if !found {
-		// See if mmsg sets the envvar when run
-
-		_, _, _, process_err := os.process_exec({command = {"mmsg"}}, allocator = alloc)
-		if process_err != nil {
-			fmt.eprintfln("Failed invoking mmsg: %v", process_err)
-			return .Mango_Wrapper_Error
-		}
-		mango_socket_path, found := os.lookup_env(MANGO_SOCKET_ENVVAR, allocator = alloc)
+	// Get mango socket path
+	mango_socket_path: string
+	{
+		found: bool
+		mango_socket_path, found = os.lookup_env(MANGO_SOCKET_PATH_ENVVAR, allocator = alloc)
 		if !found {
-			fmt.eprintln("Failure: Mango IPC socket is not set")
-			return .Mango_Error
+			// See if mmsg sets the envvar when run
+
+			_, _, _, process_err := os.process_exec({command = {"mmsg"}}, allocator = alloc)
+			if process_err != nil {
+				fmt.eprintfln("Failed invoking mmsg: %v", process_err)
+				return .Mango_Wrapper_Error
+			}
+			mango_socket_path, found := os.lookup_env(MANGO_SOCKET_PATH_ENVVAR, allocator = alloc)
+			if !found {
+				fmt.eprintln("Failure: Mango IPC socket is not set")
+				return .Mango_Error
+			}
 		}
 	}
+
+	// Set up connection to mango socket
 	watch_socket, watch_socket_err := linux.socket(
 		.UNIX,
 		.STREAM,
@@ -127,6 +129,7 @@ entrypoint :: proc() -> (program_err: Program_Error) {
 		fmt.eprintfln("Failed creating socket: %v", errno_str)
 		return .Mango_Wrapper_Error
 	}
+	defer linux.close(watch_socket)
 
 	watch_socket_addr := linux.Sock_Addr_Un {
 		sun_family = .UNIX,
@@ -136,13 +139,12 @@ entrypoint :: proc() -> (program_err: Program_Error) {
 		raw_data(mango_socket_path),
 		min(len(mango_socket_path), len(watch_socket_addr.sun_path) - 1),
 	)
-	if watch_socket_err = linux.connect(watch_socket, &watch_socket_addr);
-	   watch_socket_err != nil {
+	watch_socket_err = linux.connect(watch_socket, &watch_socket_addr)
+	if watch_socket_err != nil {
 		errno_str := libc.strerror(i32(watch_socket_err))
 		fmt.eprintfln("Failed connecting to mango IPC socket: %v", errno_str)
 		return .Mango_Wrapper_Error
 	}
-	defer linux.close(watch_socket)
 	vmem.arena_temp_end(temp_begin)
 
 	// Allocate buffers for watch connection and server sockets
@@ -183,8 +185,10 @@ entrypoint :: proc() -> (program_err: Program_Error) {
 
 		// Watch mango changes if any
 		watch_bytes_read, watch_recv_err := linux.recv(watch_socket, watch_buf, {})
-		if watch_recv_err != nil && watch_recv_err != .EWOULDBLOCK {
-			fmt.eprintfln("Failed reading mango IPC socket: %v", watch_recv_err)
+		if watch_recv_err != nil {
+			if watch_recv_err != .EWOULDBLOCK {
+				fmt.eprintfln("Failed reading mango IPC socket: %v", watch_recv_err)
+			}
 		} else if watch_bytes_read > 0 {
 			// JSON parsing
 			json_data, json_err := json.parse(watch_buf[:watch_bytes_read], allocator = alloc)

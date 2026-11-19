@@ -66,38 +66,71 @@ entrypoint :: proc() -> (program_err: Program_Error) {
 		}
 	}
 
-	// Get server socket path
-	server_socket_path, found := os.lookup_env(SOCKET_PATH_ENVVAR, allocator = alloc)
-	if !found {
-		fmt.eprintln("Failed to get server socket address (is it running?)")
-		return .Mango_Wrapper_Error
-	}
-
-	// Connect to server socket
-	client_socket: linux.Fd
+	// Get possible server socket paths
+	possible_server_sockets: [dynamic; 3]string
 	{
-		errno: linux.Errno
-		if client_socket, errno = linux.socket(.UNIX, .STREAM, {.CLOEXEC}, linux.Protocol(0));
-		   errno != nil {
-			errno_str := libc.strerror(i32(errno))
-			fmt.eprintfln("Failed to create client socket: %v", errno_str)
-			return .Mango_Wrapper_Error
+		path, found := os.lookup_env(SOCKET_PATH_ENVVAR, allocator = alloc)
+		if found {
+			append(&possible_server_sockets, path)
 		}
 
+		basename := "mango-wrapper.sock"
+		path, found = os.lookup_env("XDG_RUNTIME_DIR", allocator = alloc)
+		if found {
+			concat_path := fmt.aprintf("%s/%s", path, basename)
+			append(&possible_server_sockets, concat_path)
+		}
+
+		temp_dir := "/tmp"
+		concat_path := fmt.aprintf("%s/%s", temp_dir, basename)
+		append(&possible_server_sockets, concat_path)
+	}
+
+	// Connect to possible server socket paths
+	client_socket: linux.Fd
+	socket_found: bool
+	{
 		addr := linux.Sock_Addr_Un {
 			sun_family = .UNIX,
 		}
-		mem.copy(
-			&addr.sun_path,
-			raw_data(server_socket_path),
-			min(len(server_socket_path), len(addr.sun_path) - 1),
-		)
-		if errno = linux.connect(client_socket, &addr); errno != nil {
+		for socket_path in possible_server_sockets {
+			// connect(2) tells that the state of the socket should be
+			// considered unspecified should connect fail, so create and close
+			// a new one every iteration
+			errno: linux.Errno
+			if client_socket, errno = linux.socket(.UNIX, .STREAM, {.CLOEXEC}, linux.Protocol(0));
+			   errno != nil {
+				errno_str := libc.strerror(i32(errno))
+				fmt.eprintfln("Failed to create client socket: %v", errno_str)
+				return .Mango_Wrapper_Error
+			}
+
+			mem.copy(
+				&addr.sun_path,
+				raw_data(socket_path),
+				min(len(socket_path), len(addr.sun_path) - 1),
+			)
+			errno = linux.connect(client_socket, &addr)
+			if errno == nil {
+				socket_found = true
+				break
+			}
+			// Path not found
+			if errno == .ENOENT {
+				linux.close(client_socket)
+				continue
+			}
+
 			errno_str := libc.strerror(i32(errno))
 			fmt.eprintfln("Failed to connect to server socket: %v", errno_str)
 			return .Mango_Wrapper_Error
 		}
 	}
+	if !socket_found {
+		fmt.eprintln("Failed to get server socket address (is it running?)")
+		return .Mango_Wrapper_Error
+	}
+	defer linux.close(client_socket)
 
 	vmem.arena_temp_end(temp_begin)
 
@@ -106,7 +139,7 @@ entrypoint :: proc() -> (program_err: Program_Error) {
 	mem.copy(&client_buf, &message, size_of(message))
 	bytes_written := len(fmt.bprintf(client_buf, "%v", options.command))
 	if (options.args != nil) {
-		bytes_written += len(fmt.bprintf(client_buf, "%v", options.args))
+		bytes_written += len(fmt.bprintf(client_buf, ",%v", options.args))
 	}
 
 	write_data := client_buf[:bytes_written]
