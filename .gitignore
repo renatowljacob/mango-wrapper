@@ -1,1 +1,3 @@
 *-bin
+client/common.odin
+server/common.odin
