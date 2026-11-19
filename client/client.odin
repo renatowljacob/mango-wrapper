@@ -15,8 +15,8 @@ main :: proc() {
 @(private = "file")
 entrypoint :: proc() -> (program_err: Program_Error) {
 	Options :: struct {
-		command: string `args:pos=0,required usage:"Command to send to the server"`,
-		args:    Maybe(string) `args:pos=1 usage:"Command arguments if any"`,
+		command: string `args:"pos=0,required" usage:"Command to send to the server"`,
+		args:    Maybe(string) `args:"pos=1" usage:"Command arguments if any"`,
 	}
 
 	arena: vmem.Arena
@@ -30,12 +30,7 @@ entrypoint :: proc() -> (program_err: Program_Error) {
 	options: Options
 	flags.parse_or_exit(&options, os.args, flags.Parsing_Style.Odin, allocator = alloc)
 
-	if program_name, err := check_for_mango(alloc); err != nil {
-		if err == .Program_Not_Found {
-			fmt.eprintfln("Failure: %v not found", program_name)
-		} else if err != nil {
-			fmt.eprintfln("Failed invoking command -v: %v", err)
-		}
+	if err := check_for_mango(alloc); err != nil {
 		return err
 	}
 
@@ -108,6 +103,7 @@ entrypoint :: proc() -> (program_err: Program_Error) {
 
 	// Send data to server socket
 	client_buf := make([]u8, mem.Kilobyte, alloc)
+	mem.copy(&client_buf, &message, size_of(message))
 	bytes_written := len(fmt.bprintf(client_buf, "%v", options.command))
 	if (options.args != nil) {
 		bytes_written += len(fmt.bprintf(client_buf, "%v", options.args))

@@ -1,5 +1,6 @@
 package main
 
+import "core:fmt"
 import "core:mem"
 import "core:os"
 
@@ -105,17 +106,19 @@ Message :: struct {
 	layout:  Layout,
 }
 
-check_for_mango :: proc(alloc := context.allocator) -> (Maybe(string), Program_Error) {
-	tests := [][3]string{{"command", "-v", "mango"}, {"command", "-v", "mmsg"}}
+check_for_mango :: proc(alloc := context.allocator) -> Program_Error {
+	tests := [][2]string{{"which", "mango"}, {"which", "mmsg"}}
 	for &test in tests {
 		state, _, _, err := os.process_exec({command = test[:]}, alloc)
 		if state.exit_code != 0 {
-			return test[1], .Program_Not_Found
+			fmt.eprintfln("Failure: %v not found", test[1])
+			return .Program_Not_Found
 		}
 		if err != nil {
-			return nil, .Mango_Wrapper_Error
+			fmt.eprintfln("Failed invoking command -v: %v", err)
+			return .Mango_Wrapper_Error
 		}
 	}
 
-	return nil, .None
+	return .None
 }
