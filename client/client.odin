@@ -7,6 +7,7 @@ import "core:mem"
 import vmem "core:mem/virtual"
 import "core:os"
 import "core:sys/linux"
+import "core:time"
 
 main :: proc() {
 	os.exit(int(entrypoint()))
@@ -16,7 +17,7 @@ main :: proc() {
 entrypoint :: proc() -> (program_err: Program_Error) {
 	Options :: struct {
 		command: string `args:"pos=0,required" usage:"Command to send to the server"`,
-		args:    Maybe(string) `args:"pos=1" usage:"Command arguments if any"`,
+		args:    string `args:"pos=1" usage:"Command arguments if any"`,
 	}
 
 	arena: vmem.Arena
@@ -44,10 +45,10 @@ entrypoint :: proc() -> (program_err: Program_Error) {
 				break
 			}
 		}
-		if message.command == .None {
-			fmt.eprintfln("Error: Command not found")
-			return .Command_Not_Found
-		}
+		// if message.command == .None {
+		// 	fmt.eprintfln("Error: Command not found")
+		// 	return .Command_Not_Found
+		// }
 
 		#partial switch message.command {
 		case .Set_Layout, .Switch_Layout, .Toggle_Layout:
@@ -58,10 +59,10 @@ entrypoint :: proc() -> (program_err: Program_Error) {
 					break
 				}
 			}
-			if message.layout == .None {
-				fmt.eprintfln("Error: Layout not found")
-				return .Layout_Not_Found
-			}
+		// if message.layout == .None {
+		// 	fmt.eprintfln("Error: Layout not found")
+		// 	return .Layout_Not_Found
+		// }
 		case:
 		}
 	}
@@ -94,12 +95,16 @@ entrypoint :: proc() -> (program_err: Program_Error) {
 			sun_family = .UNIX,
 		}
 		for socket_path in possible_server_sockets {
-			// connect(2) tells that the state of the socket should be
-			// considered unspecified should connect fail, so create and close
-			// a new one every iteration
+			// NOTE: connect(2) tells that the state of the socket should be
+			// considered unspecified should connect fail, so simply close and
+			// create a new one every iteration
 			errno: linux.Errno
-			if client_socket, errno = linux.socket(.UNIX, .STREAM, {.CLOEXEC}, linux.Protocol(0));
-			   errno != nil {
+			if client_socket, errno = linux.socket(
+				.UNIX,
+				.STREAM,
+				{.NONBLOCK, .CLOEXEC},
+				linux.Protocol(0),
+			); errno != nil {
 				errno_str := libc.strerror(i32(errno))
 				fmt.eprintfln("Failed to create client socket: %v", errno_str)
 				return .Mango_Wrapper_Error
@@ -135,21 +140,44 @@ entrypoint :: proc() -> (program_err: Program_Error) {
 	vmem.arena_temp_end(temp_begin)
 
 	// Send data to server socket
-	client_buf := make([]u8, mem.Kilobyte, alloc)
-	mem.copy(&client_buf, &message, size_of(message))
-	bytes_written := len(fmt.bprintf(client_buf, "%v", options.command))
-	if (options.args != nil) {
-		bytes_written += len(fmt.bprintf(client_buf, ",%v", options.args))
+	client_buf, alloc_err := make([]u8, mem.Kilobyte, alloc)
+	if alloc_err != nil {
+		fmt.eprintfln("Failed allocating memory: %v", alloc_err)
+		return .Mango_Wrapper_Error
+	}
+	mem.copy(raw_data(client_buf), &message, size_of(message))
+
+	write_data := client_buf[:size_of(message)]
+	if _, errno := linux.send(client_socket, write_data, {}); errno != nil {
+		err_str := libc.strerror(i32(errno))
+		fmt.eprintfln("Error sending data to server: %v", err_str)
+		return .Mango_Wrapper_Error
 	}
 
-	write_data := client_buf[:bytes_written]
-	linux.send(client_socket, write_data, {})
+	read_data := client_buf[size_of(message):]
+	now := time.now()
+	diff: time.Duration
+	client_bytes_read: int
+	for diff <= time.Second / 2 {
+		time.sleep(SLEEP_TIME)
+		diff = time.since(now)
+		client_recv_err: linux.Errno
+		client_bytes_read, client_recv_err = linux.recv(client_socket, read_data, {})
+		if client_recv_err != nil && client_recv_err != .EWOULDBLOCK {
+			err_str := libc.strerror(i32(client_recv_err))
+			fmt.eprintfln("Error receiving server data: %v", err_str)
+			return .Mango_Wrapper_Error
+		}
+		if client_bytes_read > 0 {
+			break
+		}
+	}
+	if client_bytes_read <= 0 {
+		fmt.eprintln("Error: didn't receive message from server")
+		return .Mango_Wrapper_Error
+	}
 
-	read_data := client_buf[bytes_written:]
-	linux.recv(client_socket, read_data, {})
-
-	// Read it as Message
-	message_error := (transmute([]Message_Error)read_data)[0]
+	message_error := (^Message_Error)(raw_data(read_data))^
 	switch message_error {
 	case .Set_Layout_Without_Layout:
 		fmt.eprintfln("Error: setlayout didn't specify a layout")

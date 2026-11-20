@@ -1,3 +1,5 @@
 *-bin
+*.rdi
 client/common.odin
 server/common.odin
+install.sh

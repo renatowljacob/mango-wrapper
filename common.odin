@@ -3,12 +3,14 @@ package main
 import "core:fmt"
 import "core:mem"
 import "core:os"
+import "core:time"
 
 // Can Mango be run on BSDs?
 when ODIN_OS != .Linux {
 	#panic("OS not supported")
 }
 
+SLEEP_TIME :: time.Millisecond
 TAG_NUM :: 6
 BUF_SIZE :: mem.Megabyte
 MANGO_SOCKET_PATH_ENVVAR :: "MANGO_INSTANCE_SIGNATURE"
@@ -26,7 +28,6 @@ Program_Error :: enum {
 }
 
 Command :: enum {
-	None,
 	Set_Layout,
 	Switch_Layout,
 	Toggle_Layout,
@@ -38,14 +39,14 @@ Command :: enum {
 	Tag,
 	Tag_To_Left,
 	Tag_To_Right,
+	None,
 }
 
 @(rodata)
 command_symbols := [Command]string {
-	.None                      = "",
 	.Set_Layout                = "setlayout",
 	.Switch_Layout             = "switch_layout",
-	.Toggle_Layout             = "", // custom
+	.Toggle_Layout             = "toggle_layout", // custom
 	.View                      = "view",
 	.View_To_Left              = "viewtoleft",
 	.View_To_Right             = "viewtoright",
@@ -54,14 +55,14 @@ command_symbols := [Command]string {
 	.Tag                       = "tag",
 	.Tag_To_Left               = "tagtoleft",
 	.Tag_To_Right              = "tagtoleft",
+	.None                      = "",
 }
 
 Layout :: enum {
-	None,
 	Tile,
 	Scroller,
-	Monocle,
 	Grid,
+	Monocle,
 	Deck,
 	Center_tile,
 	Vertical_Tile,
@@ -72,12 +73,12 @@ Layout :: enum {
 	Dwindle,
 	Fair,
 	Vertical_Fair,
+	None,
 }
 
 // Possible layouts
 @(rodata)
 layout_symbols := [Layout]string {
-	.None              = "",
 	.Tile              = "tile",
 	.Scroller          = "scroller",
 	.Monocle           = "monocle",
@@ -92,6 +93,7 @@ layout_symbols := [Layout]string {
 	.Dwindle           = "dwindle",
 	.Fair              = "fair",
 	.Vertical_Fair     = "vertical_fair",
+	.None              = "",
 }
 
 Message_Error :: enum {

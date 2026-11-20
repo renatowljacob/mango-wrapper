@@ -96,6 +96,8 @@ entrypoint :: proc() -> (program_err: Program_Error) {
 	}
 	fmt.printfln("Listening on %v", server_socket_path)
 
+	vmem.arena_temp_end(temp_begin)
+
 	// Get mango socket path
 	mango_socket_path: string
 	{
@@ -145,7 +147,6 @@ entrypoint :: proc() -> (program_err: Program_Error) {
 		fmt.eprintfln("Failed connecting to mango IPC socket: %v", errno_str)
 		return .Mango_Wrapper_Error
 	}
-	vmem.arena_temp_end(temp_begin)
 
 	// Allocate buffers for watch connection and server sockets
 	watch_buf, server_buf: []u8
@@ -158,7 +159,7 @@ entrypoint :: proc() -> (program_err: Program_Error) {
 		}
 
 		// Watch mango changes
-		mango_command := fmt.bprint(watch_buf, "watch all-monitors")
+		mango_command := fmt.bprint(watch_buf, "watch all-monitors\n")
 		if _, errno := linux.send(watch_socket, watch_buf[:len(mango_command)], {}); errno != nil {
 			errno_str := libc.strerror(i32(errno))
 			fmt.eprintfln("Failed sending watch all-monitors to mango IPC socket: %v", errno_str)
@@ -196,7 +197,7 @@ entrypoint :: proc() -> (program_err: Program_Error) {
 				fmt.eprintfln("Failed parsing JSON: %v", json_err)
 				continue
 			}
-			defer json.destroy_value(json_data)
+			defer json.destroy_value(json_data, allocator = alloc)
 
 			root := json_data.(json.Object)
 			monitors := root["monitors"].(json.Array)
@@ -214,22 +215,23 @@ entrypoint :: proc() -> (program_err: Program_Error) {
 				continue
 			}
 
-			layout_index := active_monitor["layout_index"].(json.Integer)
+			layout_index := int(active_monitor["layout_index"].(json.Float))
 			state.monitor.layout = cast(Layout)layout_index
 
 			active_tags := active_monitor["active_tags"].(json.Array)
 			if len(active_tags) == 1 {
-				state.monitor.active_tag = int(active_tags[0].(json.Integer))
+				state.monitor.active_tag = int(active_tags[0].(json.Float))
 			}
 
 			tags := active_monitor["tags"].(json.Array)
 			for i in 0 ..< len(state.monitor.tags) {
 				tag := tags[i].(json.Object)
-				has_clients := tag["client_count"].(json.Integer) > 0
+				has_clients := int(tag["client_count"].(json.Float)) > 0
 				if has_clients {
 					state.monitor.tags[i] = true
 				}
 			}
+			fmt.println(state.monitor)
 		}
 
 		// Sync
@@ -253,27 +255,45 @@ entrypoint :: proc() -> (program_err: Program_Error) {
 
 			continue
 		}
+		fmt.println("Established connection")
 
 		// Read client commands if any
-		connection_bytes_read, connection_recv_err := linux.recv(connection_socket, server_buf, {})
-		if connection_recv_err != nil || connection_bytes_read < size_of(Message) {
-			if connection_recv_err != .EWOULDBLOCK {
-				fmt.eprintfln("Failed reading IPC socket: %v", connection_recv_err)
+		now := time.now()
+		diff: time.Duration
+		connection_bytes_read: int
+		for diff <= time.Second / 2 {
+			time.sleep(SLEEP_TIME)
+			diff = time.since(now)
+			connection_recv_err: linux.Errno
+			connection_bytes_read, connection_recv_err = linux.recv(
+				connection_socket,
+				server_buf,
+				{},
+			)
+			if connection_recv_err != nil && connection_recv_err != .EWOULDBLOCK {
+				err_str := libc.strerror(i32(connection_recv_err))
+				fmt.eprintfln("Error receiving client data: %v", err_str)
+				return .Mango_Wrapper_Error
 			}
-
+			if connection_bytes_read > 0 {
+				break
+			}
+		}
+		if connection_bytes_read <= 0 {
+			fmt.eprintln("Error: didn't receive message from client")
 			continue
 		}
 
 		builder: strings.Builder
 		strings.builder_init(&builder, alloc)
-		fmt.sbprintf(&builder, "mmsg dispatch ")
+		fmt.sbprintf(&builder, "dispatch ")
 
 		write_data := server_buf[connection_bytes_read:]
-		message_error := (transmute([]Message_Error)write_data)[0]
+		message_error := (^Message_Error)(raw_data(write_data))^
 		message_error = .None
 
 		read_data := server_buf[:connection_bytes_read]
-		message := (transmute([]Message)read_data)[0]
+		message := (^Message)(raw_data(read_data))^
 		switch message.command {
 		case .None:
 			fallthrough
@@ -308,7 +328,7 @@ entrypoint :: proc() -> (program_err: Program_Error) {
 			fmt.sbprintf(
 				&builder,
 				"%v,%v",
-				command_symbols[message.command],
+				command_symbols[.Set_Layout],
 				layout_symbols[state.curr_layout],
 			)
 		case .View_To_Right:
@@ -375,21 +395,51 @@ entrypoint :: proc() -> (program_err: Program_Error) {
 			}
 		}
 
+		// Send command back to mango socket
 		if message_error == .None {
-			cmd := strings.to_string(builder)
-			cmd_arr := strings.split(cmd, " ", alloc)
-			process_state, _, _, process_err := os.process_exec({command = cmd_arr[:]}, alloc)
-			if process_err != nil {
-				fmt.eprintfln("Failed invoking mmsg: %v", process_err)
-				message_error = .Server_Error
+			some_buf := make([]u8, mem.Kilobyte, alloc)
+			bytes_to_send := len(fmt.bprintf(some_buf, "%s\n", strings.to_string(builder)))
+			send_socket, send_socket_err := linux.socket(
+				.UNIX,
+				.STREAM,
+				{.NONBLOCK, .CLOEXEC},
+				linux.Protocol(0),
+			)
+			if send_socket_err != nil {
+				errno_str := libc.strerror(i32(send_socket_err))
+				fmt.eprintfln("Failed creating socket: %v", errno_str)
+				return .Mango_Wrapper_Error
 			}
-			if process_state.exit_code != 0 {
-				fmt.eprintfln("mmsg exit code: %v", process_state.exit_code)
-				message_error = .Server_Error
+			defer linux.close(send_socket)
+
+			// NOTE: Honestly, I don't really know why, but if we don't stop
+			// receiving (e.g. shutdown read), the data is not sent (I guess
+			// the connection is not completed). I feel like this has something
+			// to do with this:
+			// https://blog.netherlabs.nl/articles/2009/01/18/the-ultimate-so_linger-page-or-why-is-my-tcp-not-reliable
+			linux.shutdown(send_socket, .RD)
+
+			send_socket_err = linux.connect(send_socket, &watch_socket_addr)
+			if send_socket_err != nil {
+				errno_str := libc.strerror(i32(send_socket_err))
+				fmt.eprintfln("Failed connecting to mango IPC socket: %v", errno_str)
+				return .Mango_Wrapper_Error
 			}
+			bytes_sent, send_err := linux.send(send_socket, some_buf[:], {})
+			if send_err != nil {
+				errno_str := libc.strerror(i32(send_err))
+				fmt.eprintfln("Failed sending data to mango IPC socket: %v", errno_str)
+				return .Mango_Wrapper_Error
+			}
+
+			fmt.println(bytes_sent)
+			fmt.println(string(some_buf[:bytes_sent]))
+			fmt.println(some_buf[:bytes_sent])
 		}
 
 		linux.send(server_socket, write_data, {})
+		fmt.println(message)
+		fmt.println(read_data)
 	}
 
 	return program_err
@@ -398,7 +448,7 @@ entrypoint :: proc() -> (program_err: Program_Error) {
 // 1-based index
 wrap_forwards :: proc(active_tag: ^int, command: Command, builder: ^strings.Builder) -> bool {
 	if active_tag^ >= 6 {
-		active_tag^ = ((active_tag^ - 1) %% 6) + 1
+		active_tag^ = (active_tag^ + 1) %% 6
 		fmt.sbprintf(builder, "%v,%v", command_symbols[command], active_tag^)
 
 		return true
@@ -409,7 +459,7 @@ wrap_forwards :: proc(active_tag: ^int, command: Command, builder: ^strings.Buil
 
 // 1-based index
 wrap_backwards :: proc(active_tag: ^int, command: Command, builder: ^strings.Builder) -> bool {
-	if active_tag^ <= 6 {
+	if active_tag^ <= 1 {
 		active_tag^ = ((active_tag^ - 2) %% 6) + 1
 		fmt.sbprintf(builder, "%v,%v", command_symbols[command], active_tag^)
 
