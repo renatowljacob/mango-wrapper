@@ -1,6 +1,5 @@
 package main
 
-import "core:c/libc"
 import "core:encoding/json"
 import "core:fmt"
 import "core:mem"
@@ -10,14 +9,16 @@ import "core:strings"
 import "core:sys/linux"
 import "core:time"
 
-Tag :: int
 Tags :: [TAG_NUM]bool
-State :: struct {
+Tag :: struct {
 	prev_layout, curr_layout: Layout,
-	active_tag:               Tag,
-	monitor:                  struct {
+}
+State :: struct {
+	active_tag: int,
+	tags:       [TAG_NUM]Tag,
+	monitor:    struct {
 		layout:     Layout,
-		active_tag: Tag,
+		active_tag: int,
 		tags:       Tags,
 	},
 }
@@ -25,8 +26,6 @@ State :: struct {
 main :: proc() {
 	os.exit(int(entrypoint()))
 }
-
-// TODO: mmsg watch all-monitors to avoid state desync and other edge cases
 
 @(private = "file")
 entrypoint :: proc() -> (program_err: Program_Error) {
@@ -52,8 +51,7 @@ entrypoint :: proc() -> (program_err: Program_Error) {
 		linux.Protocol(0),
 	)
 	if server_socket_err != nil {
-		errno_str := libc.strerror(i32(server_socket_err))
-		fmt.eprintfln("Failed creating socket: %v", errno_str)
+		print_errno("Failed to create socket", server_socket_err)
 		return .Mango_Wrapper_Error
 	}
 	defer linux.close(server_socket)
@@ -75,23 +73,15 @@ entrypoint :: proc() -> (program_err: Program_Error) {
 	}
 	os.remove(server_socket_path)
 
-	server_socket_addr := linux.Sock_Addr_Un {
-		sun_family = .UNIX,
-	}
-	mem.copy(
-		&server_socket_addr.sun_path,
-		raw_data(server_socket_path),
-		min(len(server_socket_path), len(server_socket_addr.sun_path) - 1),
-	)
+	server_socket_addr: linux.Sock_Addr_Un
+	set_unix_socket_address(&server_socket_addr, server_socket_path)
 	if errno := linux.bind(server_socket, &server_socket_addr); errno != nil {
-		errno_str := libc.strerror(i32(errno))
-		fmt.eprintfln("Failed binding socket: %v", errno_str)
+		print_errno("Failed to bind socket", errno)
 		return .Mango_Wrapper_Error
 	}
 
 	if errno := linux.listen(server_socket, 1); errno != nil {
-		errno_str := libc.strerror(i32(errno))
-		fmt.eprintfln("Failed setting socket to listen: %v", errno_str)
+		print_errno("Failed to set socket to listen", errno)
 		return .Mango_Wrapper_Error
 	}
 	fmt.printfln("Listening on %v", server_socket_path)
@@ -108,7 +98,7 @@ entrypoint :: proc() -> (program_err: Program_Error) {
 
 			_, _, _, process_err := os.process_exec({command = {"mmsg"}}, allocator = alloc)
 			if process_err != nil {
-				fmt.eprintfln("Failed invoking mmsg: %v", process_err)
+				fmt.eprintfln("Failed to invoke mmsg: %v", process_err)
 				return .Mango_Wrapper_Error
 			}
 			mango_socket_path, found := os.lookup_env(MANGO_SOCKET_PATH_ENVVAR, allocator = alloc)
@@ -127,24 +117,16 @@ entrypoint :: proc() -> (program_err: Program_Error) {
 		linux.Protocol(0),
 	)
 	if watch_socket_err != nil {
-		errno_str := libc.strerror(i32(watch_socket_err))
-		fmt.eprintfln("Failed creating socket: %v", errno_str)
+		print_errno("Failed to create socket", watch_socket_err)
 		return .Mango_Wrapper_Error
 	}
 	defer linux.close(watch_socket)
 
-	watch_socket_addr := linux.Sock_Addr_Un {
-		sun_family = .UNIX,
-	}
-	mem.copy(
-		&watch_socket_addr.sun_path,
-		raw_data(mango_socket_path),
-		min(len(mango_socket_path), len(watch_socket_addr.sun_path) - 1),
-	)
+	watch_socket_addr: linux.Sock_Addr_Un
+	set_unix_socket_address(&watch_socket_addr, mango_socket_path)
 	watch_socket_err = linux.connect(watch_socket, &watch_socket_addr)
 	if watch_socket_err != nil {
-		errno_str := libc.strerror(i32(watch_socket_err))
-		fmt.eprintfln("Failed connecting to mango IPC socket: %v", errno_str)
+		print_errno("Failed to connect to mango IPC socket", watch_socket_err)
 		return .Mango_Wrapper_Error
 	}
 
@@ -154,47 +136,49 @@ entrypoint :: proc() -> (program_err: Program_Error) {
 		alloc_err: mem.Allocator_Error
 		watch_buf, alloc_err = make([]u8, BUF_SIZE, alloc)
 		if alloc_err != nil {
-			fmt.eprintfln("Failed allocating memory: %v", alloc_err)
+			fmt.eprintfln("Failed to allocate memory: %v", alloc_err)
 			return .Mango_Wrapper_Error
 		}
 
 		// Watch mango changes
 		mango_command := fmt.bprint(watch_buf, "watch all-monitors\n")
 		if _, errno := linux.send(watch_socket, watch_buf[:len(mango_command)], {}); errno != nil {
-			errno_str := libc.strerror(i32(errno))
-			fmt.eprintfln("Failed sending watch all-monitors to mango IPC socket: %v", errno_str)
+			print_errno("Failed to send watch all-monitors to mango IPC socket", errno)
 			return .Mango_Wrapper_Error
 		}
 
 		server_buf, alloc_err = make([]u8, BUF_SIZE, alloc)
 		if alloc_err != nil {
-			fmt.eprintfln("Failed allocating memory: %v", alloc_err)
+			fmt.eprintfln("Failed to allocate memory: %v", alloc_err)
 			return .Mango_Wrapper_Error
 		}
 	}
 
-	state := State {
-		curr_layout = .Tile,
-		prev_layout = .Monocle,
+	state: State
+	for &tag in state.tags {
+		tag = {
+			curr_layout = .Tile,
+			prev_layout = .Monocle,
+		}
 	}
 	for {
 		temp_begin = vmem.arena_temp_begin(&arena)
 		defer vmem.arena_temp_end(temp_begin)
 
 		// Avoid spinlock
-		time.sleep(time.Duration(f64(time.Millisecond) * 16.666))
+		time.sleep(SLEEP_TIME)
 
 		// Watch mango changes if any
 		watch_bytes_read, watch_recv_err := linux.recv(watch_socket, watch_buf, {})
 		if watch_recv_err != nil {
 			if watch_recv_err != .EWOULDBLOCK {
-				fmt.eprintfln("Failed reading mango IPC socket: %v", watch_recv_err)
+				fmt.eprintfln("Failed to read mango IPC socket: %v", watch_recv_err)
 			}
 		} else if watch_bytes_read > 0 {
 			// JSON parsing
 			json_data, json_err := json.parse(watch_buf[:watch_bytes_read], allocator = alloc)
 			if json_err != nil {
-				fmt.eprintfln("Failed parsing JSON: %v", json_err)
+				fmt.eprintfln("Failed to parse JSON: %v", json_err)
 				continue
 			}
 			defer json.destroy_value(json_data, allocator = alloc)
@@ -227,20 +211,18 @@ entrypoint :: proc() -> (program_err: Program_Error) {
 			for i in 0 ..< len(state.monitor.tags) {
 				tag := tags[i].(json.Object)
 				has_clients := int(tag["client_count"].(json.Float)) > 0
-				if has_clients {
-					state.monitor.tags[i] = true
-				}
+				state.monitor.tags[i] = true if has_clients else false
 			}
-			fmt.println(state.monitor)
 		}
 
 		// Sync
-		if state.curr_layout != state.monitor.layout {
-			state.prev_layout = state.curr_layout
-			state.curr_layout = state.monitor.layout
-		}
 		if state.active_tag != state.monitor.active_tag {
 			state.active_tag = state.monitor.active_tag
+		}
+		curr_tag := &state.tags[clamp(state.active_tag - 1, 0, TAG_NUM)]
+		if curr_tag.curr_layout != state.monitor.layout {
+			curr_tag.prev_layout = curr_tag.curr_layout
+			curr_tag.curr_layout = state.monitor.layout
 		}
 
 		connection_socket, connection_socket_err := linux.accept(
@@ -250,35 +232,16 @@ entrypoint :: proc() -> (program_err: Program_Error) {
 		)
 		if connection_socket_err != nil {
 			if connection_socket_err != .EWOULDBLOCK {
-				fmt.eprintfln("Failed creating connection socket: %v", connection_socket_err)
+				fmt.eprintfln("Failed to create connection socket: %v", connection_socket_err)
 			}
 
 			continue
 		}
-		fmt.println("Established connection")
 
 		// Read client commands if any
 		now := time.now()
 		diff: time.Duration
-		connection_bytes_read: int
-		for diff <= time.Second / 2 {
-			time.sleep(SLEEP_TIME)
-			diff = time.since(now)
-			connection_recv_err: linux.Errno
-			connection_bytes_read, connection_recv_err = linux.recv(
-				connection_socket,
-				server_buf,
-				{},
-			)
-			if connection_recv_err != nil && connection_recv_err != .EWOULDBLOCK {
-				err_str := libc.strerror(i32(connection_recv_err))
-				fmt.eprintfln("Error receiving client data: %v", err_str)
-				return .Mango_Wrapper_Error
-			}
-			if connection_bytes_read > 0 {
-				break
-			}
-		}
+		connection_bytes_read := recv(connection_socket, server_buf, time.Second / 2) or_return
 		if connection_bytes_read <= 0 {
 			fmt.eprintln("Error: didn't receive message from client")
 			continue
@@ -286,7 +249,7 @@ entrypoint :: proc() -> (program_err: Program_Error) {
 
 		builder: strings.Builder
 		strings.builder_init(&builder, alloc)
-		fmt.sbprintf(&builder, "dispatch ")
+		fmt.sbprintf(&builder, "mmsg dispatch ")
 
 		write_data := server_buf[connection_bytes_read:]
 		message_error := (^Message_Error)(raw_data(write_data))^
@@ -299,38 +262,10 @@ entrypoint :: proc() -> (program_err: Program_Error) {
 			fallthrough
 		case:
 			message_error = Message_Error.Message_Without_Command
-			break
 		case .View, .Tag:
-			break
-		case .Set_Layout:
-			switch message.layout {
-			case .Tile ..= .Vertical_Fair:
-				fmt.sbprintf(
-					&builder,
-					"%v,%v",
-					command_symbols[message.command],
-					layout_symbols[message.layout],
-				)
-
-				state.prev_layout = state.monitor.layout
-				state.curr_layout = message.layout
-			case .None:
-				fallthrough
-			case:
-				message_error = Message_Error.Set_Layout_Without_Layout
-			}
-		case .Switch_Layout:
-			state.prev_layout = state.curr_layout
-			state.curr_layout = cast(Layout)((int(state.curr_layout) + 1) % len(Layout))
-			fmt.sbprintf(&builder, "%v", command_symbols[message.command])
 		case .Toggle_Layout:
-			state.curr_layout, state.prev_layout = state.prev_layout, state.curr_layout
-			fmt.sbprintf(
-				&builder,
-				"%v,%v",
-				command_symbols[.Set_Layout],
-				layout_symbols[state.curr_layout],
-			)
+			curr_tag.curr_layout, curr_tag.prev_layout = curr_tag.prev_layout, curr_tag.curr_layout
+			fmt.sbprintf(&builder, "setlayout,%v", layout_symbols[curr_tag.curr_layout])
 		case .View_To_Right:
 			if wrap_forwards(&state.active_tag, .View, &builder) {
 				break
@@ -364,9 +299,8 @@ entrypoint :: proc() -> (program_err: Program_Error) {
 				if tag {
 					if i < state.active_tag {
 						has_clients_to_the_left = true
-					} else {
-						last_occupied_tag = i
 					}
+					last_occupied_tag = i
 				}
 			}
 			if has_clients_to_the_left {
@@ -381,11 +315,10 @@ entrypoint :: proc() -> (program_err: Program_Error) {
 			for i := len(state.monitor.tags); i >= 1; i -= 1 {
 				tag := state.monitor.tags[i - 1]
 				if tag {
-					if i < state.active_tag {
+					if i > state.active_tag {
 						has_clients_to_the_right = true
-					} else {
-						first_occupied_tag = i
 					}
+					first_occupied_tag = i
 				}
 			}
 			if has_clients_to_the_right {
@@ -395,51 +328,30 @@ entrypoint :: proc() -> (program_err: Program_Error) {
 			}
 		}
 
-		// Send command back to mango socket
+		// Send command back to mango
+		// NOTE: Don't try sending it over mango's socket directly (it's very brittle)
 		if message_error == .None {
-			some_buf := make([]u8, mem.Kilobyte, alloc)
-			bytes_to_send := len(fmt.bprintf(some_buf, "%s\n", strings.to_string(builder)))
-			send_socket, send_socket_err := linux.socket(
-				.UNIX,
-				.STREAM,
-				{.NONBLOCK, .CLOEXEC},
-				linux.Protocol(0),
+			cmd := strings.to_string(builder)
+			split_cmd := strings.split(cmd, " ", allocator = alloc)
+
+			process_state, _, _, process_err := os.process_exec(
+				{command = split_cmd[:]},
+				allocator = alloc,
 			)
-			if send_socket_err != nil {
-				errno_str := libc.strerror(i32(send_socket_err))
-				fmt.eprintfln("Failed creating socket: %v", errno_str)
-				return .Mango_Wrapper_Error
+			if process_err != nil {
+				fmt.eprintfln("Failed to invoke mmsg: %v", process_err)
 			}
-			defer linux.close(send_socket)
-
-			// NOTE: Honestly, I don't really know why, but if we don't stop
-			// receiving (e.g. shutdown read), the data is not sent (I guess
-			// the connection is not completed). I feel like this has something
-			// to do with this:
-			// https://blog.netherlabs.nl/articles/2009/01/18/the-ultimate-so_linger-page-or-why-is-my-tcp-not-reliable
-			linux.shutdown(send_socket, .RD)
-
-			send_socket_err = linux.connect(send_socket, &watch_socket_addr)
-			if send_socket_err != nil {
-				errno_str := libc.strerror(i32(send_socket_err))
-				fmt.eprintfln("Failed connecting to mango IPC socket: %v", errno_str)
-				return .Mango_Wrapper_Error
+			if process_state.exit_code != 0 {
+				fmt.eprintfln("mmsg exit status code: %v", process_state.exit_code)
 			}
-			bytes_sent, send_err := linux.send(send_socket, some_buf[:], {})
-			if send_err != nil {
-				errno_str := libc.strerror(i32(send_err))
-				fmt.eprintfln("Failed sending data to mango IPC socket: %v", errno_str)
-				return .Mango_Wrapper_Error
-			}
-
-			fmt.println(bytes_sent)
-			fmt.println(string(some_buf[:bytes_sent]))
-			fmt.println(some_buf[:bytes_sent])
 		}
 
-		linux.send(server_socket, write_data, {})
-		fmt.println(message)
-		fmt.println(read_data)
+		// Send error to client (None by default)
+		bytes_sent: int
+		bytes_sent, connection_socket_err = linux.send(connection_socket, write_data, {})
+		if connection_socket_err != nil {
+			print_errno("Failed to send data to client: %v", connection_socket_err)
+		}
 	}
 
 	return program_err

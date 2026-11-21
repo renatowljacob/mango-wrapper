@@ -17,7 +17,6 @@ main :: proc() {
 entrypoint :: proc() -> (program_err: Program_Error) {
 	Options :: struct {
 		command: string `args:"pos=0,required" usage:"Command to send to the server"`,
-		args:    string `args:"pos=1" usage:"Command arguments if any"`,
 	}
 
 	arena: vmem.Arena
@@ -37,33 +36,10 @@ entrypoint :: proc() -> (program_err: Program_Error) {
 
 	// Parse flags
 	message: Message
-	{
-		for command_symbol, idx in command_symbols {
-			command_idx := cast(Command)idx
-			if options.command == command_symbol {
-				message.command = command_idx
-				break
-			}
-		}
-		// if message.command == .None {
-		// 	fmt.eprintfln("Error: Command not found")
-		// 	return .Command_Not_Found
-		// }
-
-		#partial switch message.command {
-		case .Set_Layout, .Switch_Layout, .Toggle_Layout:
-			for layout_symbol, idx in layout_symbols {
-				layout_idx := cast(Layout)idx
-				if options.args == layout_symbol {
-					message.layout = layout_idx
-					break
-				}
-			}
-		// if message.layout == .None {
-		// 	fmt.eprintfln("Error: Layout not found")
-		// 	return .Layout_Not_Found
-		// }
-		case:
+	for command_symbol, idx in command_symbols {
+		if options.command == command_symbol {
+			message.command = cast(Command)idx
+			break
 		}
 	}
 
@@ -78,12 +54,12 @@ entrypoint :: proc() -> (program_err: Program_Error) {
 		basename := "mango-wrapper.sock"
 		path, found = os.lookup_env("XDG_RUNTIME_DIR", allocator = alloc)
 		if found {
-			concat_path := fmt.aprintf("%s/%s", path, basename)
+			concat_path := fmt.aprintf("%s/%s", path, basename, allocator = alloc)
 			append(&possible_server_sockets, concat_path)
 		}
 
 		temp_dir := "/tmp"
-		concat_path := fmt.aprintf("%s/%s", temp_dir, basename)
+		concat_path := fmt.aprintf("%s/%s", temp_dir, basename, allocator = alloc)
 		append(&possible_server_sockets, concat_path)
 	}
 
@@ -155,23 +131,7 @@ entrypoint :: proc() -> (program_err: Program_Error) {
 	}
 
 	read_data := client_buf[size_of(message):]
-	now := time.now()
-	diff: time.Duration
-	client_bytes_read: int
-	for diff <= time.Second / 2 {
-		time.sleep(SLEEP_TIME)
-		diff = time.since(now)
-		client_recv_err: linux.Errno
-		client_bytes_read, client_recv_err = linux.recv(client_socket, read_data, {})
-		if client_recv_err != nil && client_recv_err != .EWOULDBLOCK {
-			err_str := libc.strerror(i32(client_recv_err))
-			fmt.eprintfln("Error receiving server data: %v", err_str)
-			return .Mango_Wrapper_Error
-		}
-		if client_bytes_read > 0 {
-			break
-		}
-	}
+	client_bytes_read := recv(client_socket, read_data, time.Second / 2) or_return
 	if client_bytes_read <= 0 {
 		fmt.eprintln("Error: didn't receive message from server")
 		return .Mango_Wrapper_Error
