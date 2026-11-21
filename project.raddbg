@@ -1,0 +1,15 @@
+// raddbg 0.9.30 project file
+
+name: "Mango Wrapper"
+target:
+{
+  executable: "server-bin"
+  working_directory: ""
+  enabled: 1
+}
+target:
+{
+  executable: "client-bin"
+  working_directory: ""
+  enabled: 0
+}
